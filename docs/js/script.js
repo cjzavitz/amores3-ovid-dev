@@ -40,6 +40,153 @@ const PANEL_TYPES = {
 
 // Store OpenSeadragon instances per panel
 const osdViewers = new Map();
+// Expose for debugging and external access
+try { window.osdViewers = osdViewers; } catch (e) { /* ignore in non-browser env */ }
+
+// Annotation state for line-linked markup and preview drawing
+const annotationState = {
+  selectedLineId: null,
+  selectedLineWitness: null,
+  selectedPoem: null,
+  annotations: [],
+  activePanelId: null,
+  activeWitness: null,
+  drawing: false,
+  drawStart: null,
+  previewRect: null,
+  activeOverlay: null,
+  boundMoveHandler: null,
+  boundUpHandler: null
+};
+
+const ANNOTATION_STORAGE_KEY = 'amores-annotations';
+
+function saveAnnotationsToStorage() {
+  try {
+    localStorage.setItem(ANNOTATION_STORAGE_KEY, JSON.stringify(annotationState.annotations));
+  } catch (error) {
+    console.warn('Unable to save annotations to localStorage:', error);
+  }
+}
+
+function loadAnnotationsFromStorage() {
+  try {
+    const stored = localStorage.getItem(ANNOTATION_STORAGE_KEY);
+    if (!stored) return;
+
+    const parsed = JSON.parse(stored);
+    if (Array.isArray(parsed)) {
+      annotationState.annotations = parsed
+        .filter(item => item && item.panelId && item.witness && item.lineId)
+        .map(item => {
+          if (!item.poem) {
+            const inferred = inferAnnotationPoem(item);
+            if (inferred) {
+              item.poem = inferred;
+            }
+          }
+          return item;
+        });
+    }
+  } catch (error) {
+    console.warn('Unable to load annotations from localStorage:', error);
+    annotationState.annotations = [];
+  }
+}
+
+function inferAnnotationPoem(annotation) {
+  if (annotation.poem) return annotation.poem;
+  const witness = annotation.witness;
+  const page = annotation.page;
+  if (!witness || page == null || !witnessPageData[witness]) return null;
+  const poemKeys = Object.keys(companionData);
+  let bestMatch = null;
+
+  for (let i = 0; i < poemKeys.length; i++) {
+    const startPage = witnessPageData[witness][i];
+    if (startPage == null) continue;
+    let nextStart = null;
+    for (let j = i + 1; j < poemKeys.length; j++) {
+      if (witnessPageData[witness][j] != null) {
+        nextStart = witnessPageData[witness][j];
+        break;
+      }
+    }
+
+    if (nextStart != null) {
+      if (page >= startPage && page < nextStart) {
+        return poemKeys[i];
+      }
+    } else if (page >= startPage) {
+      bestMatch = poemKeys[i];
+    }
+  }
+
+  return bestMatch;
+}
+
+function upsertAnnotation(annotation) {
+  annotationState.annotations = annotationState.annotations.filter(a =>
+    !(a.panelId === annotation.panelId &&
+      a.witness === annotation.witness &&
+      a.lineId === annotation.lineId &&
+      (a.poem === annotation.poem || !a.poem))
+  );
+  annotationState.annotations.push(annotation);
+  saveAnnotationsToStorage();
+}
+
+function removeSavedAnnotationRects(overlay, lineId, poem) {
+  const selector = poem
+    ? `.annotation-rect[data-line-id="${lineId}"][data-poem="${poem}"]`
+    : `.annotation-rect[data-line-id="${lineId}"]`;
+  overlay.querySelectorAll(selector).forEach(el => el.remove());
+}
+
+function getOverlayRectFromImageRect(osdViewer, imageRect) {
+  const topLeftViewport = osdViewer.viewport.imageToViewportCoordinates(new OpenSeadragon.Point(imageRect.x, imageRect.y));
+  const bottomRightViewport = osdViewer.viewport.imageToViewportCoordinates(new OpenSeadragon.Point(imageRect.x + imageRect.width, imageRect.y + imageRect.height));
+
+  const topLeftViewer = osdViewer.viewport.viewportToViewerElementCoordinates(topLeftViewport);
+  const bottomRightViewer = osdViewer.viewport.viewportToViewerElementCoordinates(bottomRightViewport);
+
+  return {
+    left: topLeftViewer.x,
+    top: topLeftViewer.y,
+    width: bottomRightViewer.x - topLeftViewer.x,
+    height: bottomRightViewer.y - topLeftViewer.y
+  };
+}
+
+function restoreAnnotationRectanglesForOverlay(panel, witness) {
+  const overlay = getPanelElement(panel, `.annotation-overlay[data-witness="${witness}"]`);
+  if (!overlay) return;
+
+  const viewerId = getViewerId(panel, witness);
+  const osdViewer = osdViewers.get(viewerId);
+  if (!osdViewer) return;
+
+  // Remove any existing rendered annotation rectangles for this overlay
+  overlay.querySelectorAll('.annotation-rect').forEach(el => el.remove());
+
+  const currentPoem = getPanelElement(panel, '.poem-select')?.value;
+  const annotations = annotationState.annotations.filter(a =>
+    a.panelId === panel.id &&
+    a.witness === witness &&
+    (!currentPoem || a.poem === currentPoem)
+  );
+
+  annotations.forEach(annotation => {
+    const rect = getOverlayRectFromImageRect(osdViewer, annotation);
+    createAnnotationRect(overlay, rect.left, rect.top, rect.width, rect.height, annotation.page, annotation.lineId, false, annotation.poem);
+  });
+}
+
+function restoreAnnotationRectanglesForPanel(panel) {
+  ['P', 'Y', 'S'].forEach(witness => {
+    restoreAnnotationRectanglesForOverlay(panel, witness);
+  });
+}
 
 // Store panel states
 const panelStates = new Map();
@@ -87,6 +234,7 @@ function getPanelState(panel) {
       type: getPanelType(panel),
       poem: '',
       witness: '',
+      manuscript: 'all',
       activeWitness: null,
       companionExtras: ['commentary']
     });
@@ -105,12 +253,11 @@ function savePanelState(panel) {
     if (poemSelect) state.poem = poemSelect.value;
     if (witnessSelect) state.witness = witnessSelect.value;
   } else if (type === PANEL_TYPES.VIEWER) {
-    const activeBtn = getPanelElement(panel, '.witness-buttons button.active');
-    if (activeBtn) {
-      state.activeWitness = activeBtn.dataset.witness;
-    }
+    // For viewer panel, just save the selected poem and manuscript preference
     const poemSelect = getPanelElement(panel, '.poem-select');
+    const manuscriptSelect = getPanelElement(panel, '.manuscript-select');
     if (poemSelect) state.poem = poemSelect.value;
+    if (manuscriptSelect) state.manuscript = manuscriptSelect.value;
   } else if (type === PANEL_TYPES.COMPANION) {
     const checkboxes = getPanelElements(panel, '.companion-controls input:checked');
     state.companionExtras = Array.from(checkboxes).map(cb => cb.dataset.extra);
@@ -137,15 +284,14 @@ function restorePanelState(panel) {
     }
   } else if (type === PANEL_TYPES.VIEWER) {
     const poemSelect = getPanelElement(panel, '.poem-select');
+    const manuscriptSelect = getPanelElement(panel, '.manuscript-select');
     if (poemSelect && state.poem) {
       poemSelect.value = state.poem;
       poemSelect.dispatchEvent(new Event('change'));
     }
-    if (state.activeWitness) {
-      const witnessBtn = getPanelElement(panel, `.witness-buttons button[data-witness="${state.activeWitness}"]`);
-      if (witnessBtn) {
-        witnessBtn.click();
-      }
+    if (manuscriptSelect && state.manuscript) {
+      manuscriptSelect.value = state.manuscript;
+      manuscriptSelect.dispatchEvent(new Event('change'));
     }
   } else if (type === PANEL_TYPES.COMPANION) {
     const poemSelect = getPanelElement(panel, '.poem-select');
@@ -201,19 +347,82 @@ function createViewerPanelBody() {
     <select class="poem-select">
       <option value="">Select a poem…</option>
     </select>
-    <div class="witness-buttons">
-      <button data-witness="P">Witness P</button>
-      <button data-witness="Y">Witness Y</button>
-      <button data-witness="S">Witness S</button>
+
+    <label class="manuscript-label">View:</label>
+    <select class="manuscript-select">
+      <option value="all" selected>All (P, Y, S)</option>
+      <option value="P">Manuscript P only</option>
+      <option value="Y">Manuscript Y only</option>
+      <option value="S">Manuscript S only</option>
+    </select>
+
+    <div class="annotation-toolbar">
+      <div class="annotation-status">
+        <span>Active line: <strong class="annotation-active-line">None</strong></span>
+        <span>Source witness: <strong class="annotation-source-witness">—</strong></span>
+      </div>
+      <div class="annotation-controls">
+        <label>
+          Target:
+          <select class="annotation-witness-select">
+            <option value="P">P</option>
+            <option value="Y">Y</option>
+            <option value="S">S</option>
+          </select>
+        </label>
+        <button class="toggle-annotation" type="button">Start annotation</button>
+        <button class="clear-annotations" type="button">Clear annotations</button>
+        <button class="export-annotations" type="button">Export annotations</button>
+        <span class="annotation-message" aria-live="polite"></span>
+      </div>
     </div>
-    <div class="viewer"></div>
-    <div class="page-controls">
-      <button class="prev-page" disabled>&larr;</button>
-      <span class="page-indicator"></span>
-      <input type="number" class="page-input" min="1" disabled>
-      <button class="go-to-page" disabled>Go</button>
-      <button class="next-page" disabled>&rarr;</button>
+
+    <!-- Three vertically stacked viewers for P, Y, S manuscripts -->
+    <div class="viewers-container">
+      <div class="viewer-section" data-witness="P">
+        <div class="viewer-label">Manuscript P</div>
+        <div class="viewer-wrapper">
+          <div class="viewer" data-witness="P"></div>
+          <div class="annotation-overlay" data-witness="P"></div>
+        </div>
+        <div class="page-controls" data-witness="P">
+          <button class="prev-page" disabled>&larr;</button>
+          <span class="page-indicator"></span>
+          <input type="number" class="page-input" min="1" disabled>
+          <button class="go-to-page" disabled>Go</button>
+          <button class="next-page" disabled>&rarr;</button>
+        </div>
+      </div>
+      <div class="viewer-section" data-witness="Y">
+        <div class="viewer-label">Manuscript Y</div>
+        <div class="viewer-wrapper">
+          <div class="viewer" data-witness="Y"></div>
+          <div class="annotation-overlay" data-witness="Y"></div>
+        </div>
+        <div class="page-controls" data-witness="Y">
+          <button class="prev-page" disabled>&larr;</button>
+          <span class="page-indicator"></span>
+          <input type="number" class="page-input" min="1" disabled>
+          <button class="go-to-page" disabled>Go</button>
+          <button class="next-page" disabled>&rarr;</button>
+        </div>
+      </div>
+      <div class="viewer-section" data-witness="S">
+        <div class="viewer-label">Manuscript S</div>
+        <div class="viewer-wrapper">
+          <div class="viewer" data-witness="S"></div>
+          <div class="annotation-overlay" data-witness="S"></div>
+        </div>
+        <div class="page-controls" data-witness="S">
+          <button class="prev-page" disabled>&larr;</button>
+          <span class="page-indicator"></span>
+          <input type="number" class="page-input" min="1" disabled>
+          <button class="go-to-page" disabled>Go</button>
+          <button class="next-page" disabled>&rarr;</button>
+        </div>
+      </div>
     </div>
+
     <div class="progress-container">
       <div class="progress-bar"></div>
     </div>
@@ -240,8 +449,8 @@ function createCompanionPanelBody() {
     </select>
     <div class="companion-controls">
       <label><input type="checkbox" data-extra="commentary" checked> Commentary</label>
-      <label><input type="checkbox" data-extra="text-commentary"> Notes about Manuscripts</label>
-      <label><input type="checkbox" data-extra="vocab"> Select Vocabulary</label>
+      <label><input type="checkbox" data-extra="text-commentary"> Text Commentary</label>
+      <label><input type="checkbox" data-extra="vocab"> Vocabulary</label>
     </div>
     <div class="extra-content">
       <p>Choose a companion feature to display.</p>
@@ -269,13 +478,17 @@ function switchPanelType(panel, newType) {
   // Save current state
   savePanelState(panel);
   
-  // Destroy OpenSeadragon if switching away from viewer
+  // Destroy all OpenSeadragon viewers if switching away from viewer type
   if (getPanelType(panel) === PANEL_TYPES.VIEWER) {
     const panelId = panel.id;
-    if (osdViewers.has(panelId)) {
-      osdViewers.get(panelId).destroy();
-      osdViewers.delete(panelId);
-    }
+    // Destroy all 3 witness viewers (P, Y, S)
+    ['P', 'Y', 'S'].forEach(witness => {
+      const viewerId = `${panelId}-${witness}`;
+      if (osdViewers.has(viewerId)) {
+        osdViewers.get(viewerId).destroy();
+        osdViewers.delete(viewerId);
+      }
+    });
   }
   
   // Set new type
@@ -345,11 +558,14 @@ function createPanelHeader(type, title) {
 // PANEL-SCOPED FUNCTIONS
 // ============================================================================
 
-// Update UI for viewer panel
-function updateViewerUI(panel, currentPage, totalPages) {
-  const pageIndicator = getPanelElement(panel, '.page-indicator');
-  const pageInput = getPanelElement(panel, '.page-input');
-  const progressBar = getPanelElement(panel, '.progress-bar');
+// Update UI for a specific viewer witness
+function updateViewerUI(panel, witness, currentPage, totalPages) {
+  // Find the page controls for this specific witness
+  const pageControls = panel.querySelector(`.page-controls[data-witness="${witness}"]`);
+  if (!pageControls) return;
+  
+  const pageIndicator = pageControls.querySelector('.page-indicator');
+  const pageInput = pageControls.querySelector('.page-input');
   
   if (pageIndicator) {
     pageIndicator.textContent = `${currentPage + 1} / ${totalPages}`;
@@ -360,25 +576,34 @@ function updateViewerUI(panel, currentPage, totalPages) {
     pageInput.max = totalPages;
   }
   
+  // Update progress bar if available (use first progress bar in panel)
+  const progressBar = panel.querySelector('.progress-bar');
   if (progressBar) {
     const progress = totalPages > 1 ? (currentPage / (totalPages - 1)) * 100 : 0;
     progressBar.style.width = `${progress}%`;
   }
+
+  refreshAnnotationOverlayVisibility(panel, witness, currentPage);
 }
 
-// Update page buttons for viewer panel
-function updateViewerPageButtons(panel) {
+// Update page buttons for a specific viewer witness
+function updateViewerPageButtons(panel, witness) {
   const panelId = panel.id;
-  if (!osdViewers.has(panelId)) return;
+  const viewerId = `${panelId}-${witness}`;
+  if (!osdViewers.has(viewerId)) return;
   
-  const osdViewer = osdViewers.get(panelId);
+  const osdViewer = osdViewers.get(viewerId);
   const currentPage = osdViewer.currentPage();
   const totalPages = osdViewer.tileSources.length;
   
-  const prevBtn = getPanelElement(panel, '.prev-page');
-  const nextBtn = getPanelElement(panel, '.next-page');
-  const pageInput = getPanelElement(panel, '.page-input');
-  const goToPageBtn = getPanelElement(panel, '.go-to-page');
+  // Find the page controls for this specific witness
+  const pageControls = panel.querySelector(`.page-controls[data-witness="${witness}"]`);
+  if (!pageControls) return;
+  
+  const prevBtn = pageControls.querySelector('.prev-page');
+  const nextBtn = pageControls.querySelector('.next-page');
+  const pageInput = pageControls.querySelector('.page-input');
+  const goToPageBtn = pageControls.querySelector('.go-to-page');
   
   if (prevBtn) prevBtn.disabled = currentPage === 0;
   if (nextBtn) nextBtn.disabled = currentPage === totalPages - 1;
@@ -489,20 +714,16 @@ async function loadManifest(panel, poem, witness) {
     }
   }
   
-  // Ensure viewer element has dimensions before initializing OpenSeadragon
-  // Use requestAnimationFrame to ensure DOM is ready and dimensions are calculated
-  requestAnimationFrame(() => {
-    // Check if element has dimensions
-    const rect = viewerEl.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) {
-      // If no dimensions yet, wait a bit more
-      setTimeout(() => {
-        initializeOpenSeadragon();
-      }, 100);
-    } else {
+  // Ensure viewer element has dimensions before initializing OpenSeadragon.
+  // If the viewer already has a size, initialize immediately; otherwise wait briefly.
+  const rect = viewerEl.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) {
+    setTimeout(() => {
       initializeOpenSeadragon();
-    }
-  });
+    }, 100);
+  } else {
+    initializeOpenSeadragon();
+  }
   
   function initializeOpenSeadragon() {
     // Create OpenSeadragon instance
@@ -525,6 +746,145 @@ async function loadManifest(panel, poem, witness) {
     osdViewer.addHandler('page', (event) => {
       updateViewerUI(panel, event.page, osdViewer.tileSources.length);
       updateViewerPageButtons(panel);
+    });
+  }
+}
+
+// Load manifest for a specific witness into its container (P, Y, or S)
+async function loadManifestForWitness(panel, poem, witness) {
+  // Find the viewer container for this specific witness
+  const viewerEl = panel.querySelector(`.viewer[data-witness="${witness}"]`);
+  if (!viewerEl) return;
+  
+  const panelId = panel.id;
+  const viewerId = `${panelId}-${witness}`; // composite key for osdViewers Map
+  const manifestUrl = getManifestUrl(poem, witness);
+  
+  if (!manifestUrl) {
+    if (osdViewers.has(viewerId)) {
+      await osdViewers.get(viewerId).destroy();
+      osdViewers.delete(viewerId);
+    }
+    viewerEl.innerHTML = '<p class="viewer-placeholder">IIIF manifest not available.</p>';
+    return;
+  }
+  
+  // Destroy existing viewer for this witness
+  if (osdViewers.has(viewerId)) {
+    await osdViewers.get(viewerId).destroy();
+    osdViewers.delete(viewerId);
+  }
+  
+  // Clear the container
+  viewerEl.innerHTML = '';
+  
+  // Fetch manifest
+  let manifest;
+  try {
+    const resp = await fetch(manifestUrl);
+    manifest = await resp.json();
+  } catch (e) {
+    viewerEl.innerHTML = '<p>Failed to load IIIF manifest.</p>';
+    return;
+  }
+  
+  // Validate manifest exists
+  if (!manifest) {
+    viewerEl.innerHTML = '<p>Failed to load IIIF manifest.</p>';
+    return;
+  }
+  
+  // Extract tile sources
+  const canvases = manifest.sequences?.[0]?.canvases || manifest.items || [];
+  const tileSources = canvases.map(canvas => {
+    let imageService = null;
+    if (canvas.images && canvas.images[0]?.resource?.service) {
+      imageService = canvas.images[0].resource.service['@id'] || canvas.images[0].resource.service.id;
+    } else if (canvas.image && canvas.image.service) {
+      imageService = canvas.image.service['@id'] || canvas.image.service.id;
+    } else if (canvas.items && canvas.items[0]?.items && canvas.items[0].items[0]?.body?.service) {
+      imageService = canvas.items[0].items[0].body.service['@id'] || canvas.items[0].items[0].body.service.id;
+    }
+    if (imageService && canvas.height && canvas.width) {
+      return {
+        '@context': 'http://iiif.io/api/image/2/context.json',
+        '@id': imageService,
+        'height': canvas.height,
+        'width': canvas.width,
+        'profile': [ 'http://iiif.io/api/image/2/level2.json' ],
+        'protocol': 'http://iiif.io/api/image',
+        'tiles': [{
+          'scaleFactors': [1,2,4,8,16,32],
+          'width': 1024
+        }]
+      };
+    }
+    return null;
+  }).filter(Boolean);
+  
+  if (!tileSources.length) {
+    viewerEl.innerHTML = '<p>No IIIF images found.</p>';
+    return;
+  }
+  
+  // Determine initial page
+  let initialPage = 0;
+  const poemIndex = parseInt(poem.split('.')[1]) - 1;
+  const pageTarget = witnessPageData[witness] && witnessPageData[witness][poemIndex];
+  
+  if (pageTarget !== null && pageTarget !== undefined) {
+    if (typeof pageTarget === 'number' && pageTarget < canvases.length) {
+      initialPage = pageTarget;
+    } else if (typeof pageTarget === 'string') {
+      const pageIndex = canvases.findIndex(canvas => canvas.label === pageTarget);
+      if (pageIndex !== -1) {
+        initialPage = pageIndex;
+      }
+    }
+  }
+  
+  const rect = viewerEl.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) {
+    setTimeout(() => {
+      initializeOpenSeadragonForWitness();
+    }, 100);
+  } else {
+    initializeOpenSeadragonForWitness();
+  }
+  
+  function initializeOpenSeadragonForWitness() {
+    const osdViewer = OpenSeadragon({
+      element: viewerEl,
+      prefixUrl: 'https://openseadragon.github.io/openseadragon/images/',
+      tileSources: tileSources,
+      sequenceMode: true,
+      initialPage: initialPage,
+      crossOriginPolicy: 'Anonymous'
+    });
+    
+    osdViewers.set(viewerId, osdViewer);
+    
+    osdViewer.addHandler('open', () => {
+      updateViewerPageButtons(panel, witness);
+      updateViewerUI(panel, witness, osdViewer.currentPage(), osdViewer.tileSources.length);
+      restoreAnnotationRectanglesForOverlay(panel, witness);
+
+      // Slightly increase initial zoom so single-view images appear larger by default
+      try {
+        if (osdViewer && osdViewer.viewport && typeof osdViewer.viewport.getHomeZoom === 'function') {
+          const homeZoom = osdViewer.viewport.getHomeZoom();
+          if (typeof homeZoom === 'number' && isFinite(homeZoom)) {
+            osdViewer.viewport.zoomTo(homeZoom * 1.18, null, true);
+          }
+        }
+      } catch (err) {
+        // ignore if viewport methods differ by version
+      }
+    });
+    
+    osdViewer.addHandler('page', (event) => {
+      updateViewerUI(panel, witness, event.page, osdViewer.tileSources.length);
+      updateViewerPageButtons(panel, witness);
     });
   }
 }
@@ -571,6 +931,7 @@ async function loadTranscriptionFromXml(panel, poem, witness) {
       textContent.innerHTML = '';
       textContent.appendChild(html);
       setupHighlightListeners(panel);
+      attachClickableLineHandlers(panel);
     } else {
       textContent.innerHTML = '<p>Transcription not available for this poem.</p>';
     }
@@ -589,6 +950,499 @@ function updateTranscription(panel, poem, witness) {
     if (textContent) {
       textContent.innerHTML = '<p>Select a witness to see the transcription.</p>';
     }
+  }
+}
+
+// Attach click handlers to rendered poem lines in the transcription panel
+function attachClickableLineHandlers(panel) {
+  const textContent = getPanelElement(panel, '.text-content');
+  if (!textContent) return;
+
+  const lineElements = Array.from(textContent.querySelectorAll('[data-line], [n]'));
+  lineElements.forEach((lineEl, index) => {
+    let lineId = lineEl.dataset.line || lineEl.getAttribute('n');
+    if (!lineId) {
+      // Fallback: if no explicit line number attribute exists, expose a sequential line index
+      lineId = String(index + 1);
+      lineEl.dataset.line = lineId;
+    }
+
+    lineEl.classList.add('clickable-line');
+
+    if (lineEl.__clickableLineHandler) {
+      lineEl.removeEventListener('click', lineEl.__clickableLineHandler);
+    }
+
+    const handler = (event) => {
+      event.stopPropagation();
+      const poem = getTextPanelPoem(panel);
+      setSelectedAnnotationLine(lineId, getTextPanelWitness(panel), poem);
+      zoomAllViewersToLine(lineId, poem);
+      console.log('Clicked poem line', lineId, 'poem', poem);
+    };
+
+    lineEl.__clickableLineHandler = handler;
+    lineEl.addEventListener('click', handler);
+  });
+}
+
+function getTextPanelWitness(panel) {
+  const witnessSelect = getPanelElement(panel, '.witness-select');
+  return witnessSelect ? witnessSelect.value : null;
+}
+
+function getTextPanelPoem(panel) {
+  const poemSelect = getPanelElement(panel, '.poem-select');
+  return poemSelect ? poemSelect.value : null;
+}
+
+function getViewerId(panel, witness) {
+  return `${panel.id}-${witness}`;
+}
+
+function setSelectedAnnotationLine(lineId, sourceWitness, poem) {
+  const changedLine = annotationState.selectedLineId !== lineId || annotationState.selectedPoem !== poem;
+  annotationState.selectedLineId = lineId;
+  annotationState.selectedLineWitness = sourceWitness || null;
+  annotationState.selectedPoem = poem || null;
+  annotationState.activePanelId = annotationState.activePanelId || null;
+
+  if (changedLine && annotationState.activePanelId && annotationState.activeWitness) {
+    const activePanel = document.getElementById(annotationState.activePanelId);
+    if (activePanel) {
+      getPanelElements(activePanel, '.annotation-overlay').forEach(overlay => clearCurrentAnnotationMarkers(overlay));
+    }
+  }
+
+  refreshAllAnnotationToolbars();
+}
+
+function getAnnotationForViewer(panel, lineId, witness, poem) {
+  return annotationState.annotations.find(annotation =>
+    annotation.panelId === panel.id &&
+    annotation.lineId === lineId &&
+    annotation.witness === witness &&
+    (annotation.poem ? annotation.poem === poem : poem == null)
+  );
+}
+
+function getViewerViewportRectFromImageRect(osdViewer, imageRect) {
+  const topLeftViewport = osdViewer.viewport.imageToViewportCoordinates(new OpenSeadragon.Point(imageRect.x, imageRect.y));
+  const bottomRightViewport = osdViewer.viewport.imageToViewportCoordinates(new OpenSeadragon.Point(imageRect.x + imageRect.width, imageRect.y + imageRect.height));
+
+  return new OpenSeadragon.Rect(
+    topLeftViewport.x,
+    topLeftViewport.y,
+    bottomRightViewport.x - topLeftViewport.x,
+    bottomRightViewport.y - topLeftViewport.y
+  );
+}
+
+function zoomViewerToAnnotation(panel, witness, annotation) {
+  const viewerId = getViewerId(panel, witness);
+  const osdViewer = osdViewers.get(viewerId);
+  if (!osdViewer) return;
+
+  const pageIndex = Math.max(0, annotation.page - 1);
+  const fitBounds = () => {
+    const fitRectangle = getViewerViewportRectFromImageRect(osdViewer, annotation);
+    if (fitRectangle.width <= 0 || fitRectangle.height <= 0) return;
+    osdViewer.viewport.fitBounds(fitRectangle, true);
+
+    try {
+      const container = osdViewer.element.closest('.viewers-container');
+      const currentSection = osdViewer.element.closest('.viewer-section');
+      if (container && currentSection) {
+        const visibleSections = Array.from(container.querySelectorAll('.viewer-section'))
+          .filter(section => section.offsetParent !== null);
+        const totalSections = container.querySelectorAll('.viewer-section').length;
+        if (visibleSections.length === 1 && totalSections > 1) {
+          const viewerRect = osdViewer.element.getBoundingClientRect();
+          const baselineHeight = container.getBoundingClientRect().height / totalSections;
+          const adjustment = viewerRect.height / baselineHeight;
+          if (adjustment > 1.1 && isFinite(adjustment)) {
+            const currentZoom = osdViewer.viewport.getZoom();
+            osdViewer.viewport.zoomTo(currentZoom / adjustment, null, true);
+          }
+        }
+      }
+    } catch (e) {
+      // ignore if measurement fails
+    }
+  };
+
+  if (osdViewer.currentPage() !== pageIndex) {
+    const pageHandler = () => {
+      fitBounds();
+      osdViewer.removeHandler('page', pageHandler);
+    };
+    osdViewer.addHandler('page', pageHandler);
+    osdViewer.goToPage(pageIndex);
+  } else {
+    fitBounds();
+  }
+}
+
+function zoomAllViewersToLine(lineId, poem) {
+  const viewerPanels = Array.from(document.querySelectorAll('section[data-panel-type="viewer"]'));
+  viewerPanels.forEach(panel => {
+    ['P', 'Y', 'S'].forEach(witness => {
+      const annotation = getAnnotationForViewer(panel, lineId, witness, poem);
+      if (annotation) {
+        zoomViewerToAnnotation(panel, witness, annotation);
+      }
+    });
+  });
+}
+
+function refreshAllAnnotationToolbars() {
+  document.querySelectorAll('section[data-panel-type="viewer"]').forEach(panel => {
+    refreshAnnotationToolbar(panel);
+  });
+}
+
+function refreshAnnotationToolbar(panel) {
+  const activeLineEl = getPanelElement(panel, '.annotation-active-line');
+  const sourceEl = getPanelElement(panel, '.annotation-source-witness');
+  const toggleBtn = getPanelElement(panel, '.toggle-annotation');
+  const messageEl = getPanelElement(panel, '.annotation-message');
+  const targetSelect = getPanelElement(panel, '.annotation-witness-select');
+  const isActive = annotationState.activePanelId === panel.id && annotationState.activeWitness;
+
+  if (activeLineEl) {
+    activeLineEl.textContent = annotationState.selectedLineId || 'None';
+  }
+
+  if (sourceEl) {
+    sourceEl.textContent = annotationState.selectedLineWitness || '—';
+  }
+
+  if (toggleBtn) {
+    toggleBtn.textContent = isActive ? 'Stop annotation' : 'Start annotation';
+    toggleBtn.disabled = !annotationState.selectedLineId;
+  }
+
+  if (messageEl && !messageEl.textContent) {
+    messageEl.textContent = '';
+  }
+
+  if (targetSelect && annotationState.selectedLineWitness && ['P', 'Y', 'S'].includes(annotationState.selectedLineWitness)) {
+    targetSelect.value = annotationState.selectedLineWitness;
+  }
+
+  ['P', 'Y', 'S'].forEach(witness => {
+    const overlay = getPanelElement(panel, `.annotation-overlay[data-witness="${witness}"]`);
+    if (overlay) {
+      const shouldEnable = isActive && annotationState.activeWitness === witness;
+      overlay.classList.toggle('active', shouldEnable);
+      overlay.style.pointerEvents = shouldEnable ? 'auto' : 'none';
+    }
+  });
+}
+
+function showAnnotationMessage(panel, message) {
+  const messageEl = getPanelElement(panel, '.annotation-message');
+  if (messageEl) {
+    messageEl.textContent = message;
+  }
+}
+
+function getPanelAnnotationTarget(panel) {
+  const targetSelect = getPanelElement(panel, '.annotation-witness-select');
+  return targetSelect ? targetSelect.value : 'P';
+}
+
+function hideAllAnnotationRectangles(panel) {
+  const overlays = getPanelElements(panel, '.annotation-overlay');
+  overlays.forEach(overlay => overlay.classList.add('hidden-rects'));
+}
+
+function clearCurrentAnnotationMarkers(overlay) {
+  overlay.querySelectorAll('.annotation-rect.current-annotation').forEach(rect => rect.classList.remove('current-annotation'));
+}
+
+function toggleAnnotationMode(panel) {
+  const targetWitness = getPanelAnnotationTarget(panel);
+  if (!annotationState.selectedLineId) {
+    showAnnotationMessage(panel, 'Select a line in the transcription first.');
+    return;
+  }
+
+  const viewerId = getViewerId(panel, targetWitness);
+  if (!osdViewers.has(viewerId)) {
+    showAnnotationMessage(panel, `Load witness ${targetWitness} before annotating.`);
+    return;
+  }
+
+  const alreadyActive = annotationState.activePanelId === panel.id && annotationState.activeWitness === targetWitness;
+  const overlays = getPanelElements(panel, '.annotation-overlay');
+  if (alreadyActive) {
+    overlays.forEach(overlay => {
+      overlay.classList.add('hidden-rects');
+      clearCurrentAnnotationMarkers(overlay);
+    });
+    annotationState.activePanelId = null;
+    annotationState.activeWitness = null;
+    removePreviewRectangle();
+    showAnnotationMessage(panel, 'Annotation mode stopped.');
+  } else {
+    overlays.forEach(overlay => {
+      overlay.classList.add('hidden-rects');
+      clearCurrentAnnotationMarkers(overlay);
+    });
+    annotationState.activePanelId = panel.id;
+    annotationState.activeWitness = targetWitness;
+    annotationState.drawing = false;
+    annotationState.previewRect = null;
+    showAnnotationMessage(panel, `Annotation mode enabled for ${targetWitness}. Draw a rectangle on the viewer.`);
+  }
+
+  refreshAllAnnotationToolbars();
+}
+
+function removePreviewRectangle() {
+  if (annotationState.previewRect) {
+    annotationState.previewRect.remove();
+    annotationState.previewRect = null;
+  }
+  annotationState.drawing = false;
+  annotationState.drawStart = null;
+  annotationState.activeOverlay = null;
+  unbindAnnotationMoveHandlers();
+}
+
+function getOverlayCoordinates(event, overlay) {
+  const rect = overlay.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(rect.width, event.clientX - rect.left)),
+    y: Math.max(0, Math.min(rect.height, event.clientY - rect.top))
+  };
+}
+
+function updateAnnotationPreview(current) {
+  if (!annotationState.previewRect || !annotationState.drawStart) return;
+
+  const start = annotationState.drawStart;
+  const left = Math.min(start.x, current.x);
+  const top = Math.min(start.y, current.y);
+  const width = Math.abs(current.x - start.x);
+  const height = Math.abs(current.y - start.y);
+
+  annotationState.previewRect.style.left = `${left}px`;
+  annotationState.previewRect.style.top = `${top}px`;
+  annotationState.previewRect.style.width = `${width}px`;
+  annotationState.previewRect.style.height = `${height}px`;
+}
+
+function finalizeAnnotation(panel, witness, overlay, endPoint) {
+  if (!annotationState.drawStart) return;
+
+  const start = annotationState.drawStart;
+  const left = Math.min(start.x, endPoint.x);
+  const top = Math.min(start.y, endPoint.y);
+  const width = Math.abs(endPoint.x - start.x);
+  const height = Math.abs(endPoint.y - start.y);
+
+  removePreviewRectangle();
+
+  if (width < 10 || height < 10) {
+    showAnnotationMessage(panel, 'Draw a larger annotation region.');
+    return;
+  }
+
+  const viewerId = getViewerId(panel, witness);
+  const osdViewer = osdViewers.get(viewerId);
+  if (!osdViewer) {
+    showAnnotationMessage(panel, `Unable to annotate ${witness} without a loaded viewer.`);
+    return;
+  }
+
+  const page = osdViewer.currentPage() + 1;
+  const imageRect = getImageRectangleFromOverlayCoords(osdViewer, left, top, width, height);
+
+  // Remove any previous annotation rectangle for this line/witness so the latest one replaces it.
+  clearCurrentAnnotationMarkers(overlay);
+  removeSavedAnnotationRects(overlay, annotationState.selectedLineId, annotationState.selectedPoem);
+  const rect = createAnnotationRect(
+    overlay,
+    left,
+    top,
+    width,
+    height,
+    page,
+    annotationState.selectedLineId,
+    true,
+    annotationState.selectedPoem
+  );
+
+  upsertAnnotation({
+    panelId: panel.id,
+    witness,
+    lineId: annotationState.selectedLineId,
+    poem: annotationState.selectedPoem,
+    sourceWitness: annotationState.selectedLineWitness,
+    page,
+    x: Math.round(imageRect.x),
+    y: Math.round(imageRect.y),
+    width: Math.round(imageRect.width),
+    height: Math.round(imageRect.height)
+  });
+
+  showAnnotationMessage(panel, `Saved annotation for ${witness} page ${page}.`);
+  refreshAnnotationOverlayVisibility(panel, witness, osdViewer.currentPage());
+}
+
+function getImageRectangleFromOverlayCoords(osdViewer, left, top, width, height) {
+  const topLeftViewport = osdViewer.viewport.viewerElementToViewportCoordinates(new OpenSeadragon.Point(left, top));
+  const bottomRightViewport = osdViewer.viewport.viewerElementToViewportCoordinates(new OpenSeadragon.Point(left + width, top + height));
+
+  const topLeftImage = osdViewer.viewport.viewportToImageCoordinates(topLeftViewport);
+  const bottomRightImage = osdViewer.viewport.viewportToImageCoordinates(bottomRightViewport);
+
+  return {
+    x: Math.min(topLeftImage.x, bottomRightImage.x),
+    y: Math.min(topLeftImage.y, bottomRightImage.y),
+    width: Math.abs(bottomRightImage.x - topLeftImage.x),
+    height: Math.abs(bottomRightImage.y - topLeftImage.y)
+  };
+}
+
+function createAnnotationRect(overlay, left, top, width, height, page, lineId, isCurrent = false, poem = null) {
+  const rect = document.createElement('div');
+  rect.className = 'annotation-rect';
+  if (isCurrent) {
+    rect.classList.add('current-annotation');
+  }
+  rect.style.left = `${left}px`;
+  rect.style.top = `${top}px`;
+  rect.style.width = `${width}px`;
+  rect.style.height = `${height}px`;
+  rect.dataset.page = String(page);
+  if (lineId) {
+    rect.dataset.lineId = lineId;
+  }
+  if (poem) {
+    rect.dataset.poem = poem;
+  }
+  overlay.appendChild(rect);
+  return rect;
+}
+
+function clearAnnotations(panel) {
+  const overlays = getPanelElements(panel, '.annotation-overlay');
+  overlays.forEach(overlay => {
+    overlay.querySelectorAll('.annotation-rect, .annotation-preview').forEach(el => el.remove());
+  });
+  annotationState.annotations = annotationState.annotations.filter(a => a.panelId !== panel.id);
+  saveAnnotationsToStorage();
+  annotationState.drawing = false;
+  annotationState.drawStart = null;
+  annotationState.previewRect = null;
+  annotationState.activeOverlay = null;
+  unbindAnnotationMoveHandlers();
+  showAnnotationMessage(panel, 'Cleared annotations in this panel.');
+  refreshAllAnnotationToolbars();
+}
+
+function exportAnnotations(panel) {
+  const payload = annotationState.annotations.filter(a => a.panelId === panel.id);
+  if (!payload.length) {
+    showAnnotationMessage(panel, 'No annotations available to export.');
+    return;
+  }
+
+  const jsonBlob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(jsonBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'amores-annotations.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showAnnotationMessage(panel, `Exported ${payload.length} annotation(s).`);
+}
+
+function refreshAnnotationOverlayVisibility(panel, witness, currentPage) {
+  const overlay = getPanelElement(panel, `.annotation-overlay[data-witness="${witness}"]`);
+  if (!overlay) return;
+
+  overlay.querySelectorAll('.annotation-rect').forEach(rect => {
+    const rectPage = Number(rect.dataset.page);
+    rect.style.display = rectPage === currentPage + 1 ? 'block' : 'none';
+  });
+}
+
+function handleAnnotationPointerDown(event, panel) {
+  const overlay = event.currentTarget;
+  const witness = overlay.dataset.witness;
+  if (annotationState.activePanelId !== panel.id || annotationState.activeWitness !== witness) return;
+  if (!annotationState.selectedLineId) {
+    showAnnotationMessage(panel, 'Select a transcription line before annotating.');
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  overlay.setPointerCapture(event.pointerId);
+
+  removePreviewRectangle();
+  annotationState.drawing = true;
+  annotationState.drawStart = getOverlayCoordinates(event, overlay);
+  annotationState.activeOverlay = overlay;
+
+  const preview = document.createElement('div');
+  preview.className = 'annotation-preview';
+  overlay.appendChild(preview);
+  annotationState.previewRect = preview;
+
+  bindAnnotationMoveHandlers(panel);
+}
+
+function handleAnnotationPointerMove(event) {
+  if (!annotationState.drawing || !annotationState.previewRect || !annotationState.activeOverlay) return;
+  const overlay = annotationState.activeOverlay;
+  const current = getOverlayCoordinates(event, overlay);
+  updateAnnotationPreview(current);
+}
+
+function handleAnnotationPointerUp(event) {
+  if (!annotationState.drawing || !annotationState.activeOverlay) return;
+  const overlay = annotationState.activeOverlay;
+  const witness = overlay.dataset.witness;
+  const endPoint = getOverlayCoordinates(event, overlay);
+  const panel = document.querySelector(`section[data-panel-type="viewer"]#${annotationState.activePanelId}`);
+  if (panel) {
+    finalizeAnnotation(panel, witness, overlay, endPoint);
+  }
+  if (overlay.hasPointerCapture && overlay.hasPointerCapture(event.pointerId)) {
+    overlay.releasePointerCapture(event.pointerId);
+  }
+  unbindAnnotationMoveHandlers();
+}
+
+function handleAnnotationPointerLeave(event) {
+  // Keep drawing alive until pointer up; do not finalize on leave.
+}
+
+function bindAnnotationMoveHandlers(panel) {
+  if (annotationState.boundMoveHandler || annotationState.boundUpHandler) return;
+  annotationState.boundMoveHandler = (event) => handleAnnotationPointerMove(event);
+  annotationState.boundUpHandler = (event) => handleAnnotationPointerUp(event);
+  document.addEventListener('pointermove', annotationState.boundMoveHandler);
+  document.addEventListener('pointerup', annotationState.boundUpHandler);
+  document.addEventListener('pointercancel', annotationState.boundUpHandler);
+}
+
+function unbindAnnotationMoveHandlers() {
+  if (annotationState.boundMoveHandler) {
+    document.removeEventListener('pointermove', annotationState.boundMoveHandler);
+    annotationState.boundMoveHandler = null;
+  }
+  if (annotationState.boundUpHandler) {
+    document.removeEventListener('pointerup', annotationState.boundUpHandler);
+    document.removeEventListener('pointercancel', annotationState.boundUpHandler);
+    annotationState.boundUpHandler = null;
   }
 }
 
@@ -818,82 +1672,148 @@ function attachPanelEventHandlers(panel) {
     }
   } else if (type === PANEL_TYPES.VIEWER) {
     const poemSelect = getPanelElement(panel, '.poem-select');
-    const witnessBtns = getPanelElements(panel, '.witness-buttons button');
-    const prevBtn = getPanelElement(panel, '.prev-page');
-    const nextBtn = getPanelElement(panel, '.next-page');
-    const pageInput = getPanelElement(panel, '.page-input');
-    const goToPageBtn = getPanelElement(panel, '.go-to-page');
+    const manuscriptSelect = getPanelElement(panel, '.manuscript-select');
     
+    // When poem is selected, load all 3 witnesses (P, Y, S) simultaneously
     if (poemSelect) {
       poemSelect.onchange = (e) => {
         const poem = e.target.value;
-        const activeBtn = getPanelElement(panel, '.witness-buttons button.active');
-        if (activeBtn && poem) {
-          const witness = activeBtn.dataset.witness;
-          loadManifest(panel, poem, witness);
+        if (poem) {
+          // Load all 3 witnesses simultaneously
+          loadManifestForWitness(panel, poem, 'P');
+          loadManifestForWitness(panel, poem, 'Y');
+          loadManifestForWitness(panel, poem, 'S');
         }
         savePanelState(panel);
       };
     }
-    
-    witnessBtns.forEach(btn => {
-      btn.onclick = () => {
-        const poem = poemSelect ? poemSelect.value : '';
-        const witness = btn.dataset.witness;
-        if (!poem) {
-          return alert('Please select a poem first.');
+
+    // Handle manuscript selector to show/hide viewers
+    if (manuscriptSelect) {
+      manuscriptSelect.onchange = (e) => {
+        const selection = e.target.value;
+        const viewersContainer = getPanelElement(panel, '.viewers-container');
+        if (viewersContainer) {
+          viewersContainer.classList.remove('hide-P', 'hide-Y', 'hide-S');
+          if (selection === 'P') {
+            viewersContainer.classList.add('hide-Y', 'hide-S');
+          } else if (selection === 'Y') {
+            viewersContainer.classList.add('hide-P', 'hide-S');
+          } else if (selection === 'S') {
+            viewersContainer.classList.add('hide-P', 'hide-Y');
+          }
+          // Add a single-view class when only one manuscript is shown so CSS can expand it
+          if (selection === 'all') {
+            viewersContainer.classList.remove('single-view');
+          } else {
+            viewersContainer.classList.add('single-view');
+          }
         }
-        
-        witnessBtns.forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        
-        loadManifest(panel, poem, witness);
         savePanelState(panel);
-      };
-    });
-    
-    if (prevBtn) {
-      prevBtn.onclick = () => {
-        const panelId = panel.id;
-        if (osdViewers.has(panelId)) {
-          const osdViewer = osdViewers.get(panelId);
-          if (osdViewer.currentPage() > 0) {
-            osdViewer.goToPage(osdViewer.currentPage() - 1);
-          }
-        }
-      };
-    }
-    
-    if (nextBtn) {
-      nextBtn.onclick = () => {
-        const panelId = panel.id;
-        if (osdViewers.has(panelId)) {
-          const osdViewer = osdViewers.get(panelId);
-          if (osdViewer.currentPage() < osdViewer.tileSources.length - 1) {
-            osdViewer.goToPage(osdViewer.currentPage() + 1);
-          }
-        }
+        // After layout changes, give the browser a moment then refresh OpenSeadragon viewers
+        // and re-render annotation rectangles so coordinate conversions use correct sizes.
+        setTimeout(() => {
+          ['P', 'Y', 'S'].forEach(witness => {
+            const viewerId = getViewerId(panel, witness);
+            if (osdViewers.has(viewerId)) {
+              const osd = osdViewers.get(viewerId);
+              try { if (osd && typeof osd.forceRedraw === 'function') osd.forceRedraw(); } catch (e) {}
+              try { restoreAnnotationRectanglesForOverlay(panel, witness); } catch (e) {}
+            }
+          });
+        }, 120);
       };
     }
     
-    if (goToPageBtn && pageInput) {
-      goToPageBtn.onclick = () => {
-        const panelId = panel.id;
-        if (osdViewers.has(panelId)) {
-          const osdViewer = osdViewers.get(panelId);
-          const page = parseInt(pageInput.value, 10) - 1;
-          if (!isNaN(page) && page >= 0 && page < osdViewer.tileSources.length) {
-            osdViewer.goToPage(page);
-          }
-        }
-      };
+    // Attach event handlers for per-viewer page controls
+    ['P', 'Y', 'S'].forEach(witness => {
+      const pageControls = getPanelElement(panel, `.page-controls[data-witness="${witness}"]`);
+      if (!pageControls) return;
       
-      pageInput.onkeydown = (event) => {
-        if (event.key === 'Enter') {
-          goToPageBtn.click();
-        }
+      const prevBtn = pageControls.querySelector('.prev-page');
+      const nextBtn = pageControls.querySelector('.next-page');
+      const pageInput = pageControls.querySelector('.page-input');
+      const goToPageBtn = pageControls.querySelector('.go-to-page');
+      
+      if (prevBtn) {
+        prevBtn.onclick = () => {
+          const panelId = panel.id;
+          const viewerId = `${panelId}-${witness}`;
+          if (osdViewers.has(viewerId)) {
+            const osdViewer = osdViewers.get(viewerId);
+            if (osdViewer.currentPage() > 0) {
+              osdViewer.goToPage(osdViewer.currentPage() - 1);
+            }
+          }
+        };
+      }
+      
+      if (nextBtn) {
+        nextBtn.onclick = () => {
+          const panelId = panel.id;
+          const viewerId = `${panelId}-${witness}`;
+          if (osdViewers.has(viewerId)) {
+            const osdViewer = osdViewers.get(viewerId);
+            if (osdViewer.currentPage() < osdViewer.tileSources.length - 1) {
+              osdViewer.goToPage(osdViewer.currentPage() + 1);
+            }
+          }
+        };
+      }
+      
+      if (goToPageBtn && pageInput) {
+        goToPageBtn.onclick = () => {
+          const panelId = panel.id;
+          const viewerId = `${panelId}-${witness}`;
+          if (osdViewers.has(viewerId)) {
+            const osdViewer = osdViewers.get(viewerId);
+            const page = parseInt(pageInput.value, 10) - 1;
+            if (!isNaN(page) && page >= 0 && page < osdViewer.tileSources.length) {
+              osdViewer.goToPage(page);
+            }
+          }
+        };
+        
+        pageInput.onkeydown = (event) => {
+          if (event.key === 'Enter') {
+            goToPageBtn.click();
+          }
+        };
+      }
+    });
+
+    const toggleAnnotationBtn = getPanelElement(panel, '.toggle-annotation');
+    const clearAnnotationsBtn = getPanelElement(panel, '.clear-annotations');
+    const exportAnnotationsBtn = getPanelElement(panel, '.export-annotations');
+    const annotationOverlays = getPanelElements(panel, '.annotation-overlay');
+
+    if (toggleAnnotationBtn) {
+      toggleAnnotationBtn.onclick = () => {
+        toggleAnnotationMode(panel);
       };
     }
+
+    if (clearAnnotationsBtn) {
+      clearAnnotationsBtn.onclick = () => {
+        clearAnnotations(panel);
+      };
+    }
+
+    if (exportAnnotationsBtn) {
+      exportAnnotationsBtn.onclick = () => {
+        exportAnnotations(panel);
+      };
+    }
+
+    annotationOverlays.forEach(overlay => {
+      overlay.onpointerdown = (event) => handleAnnotationPointerDown(event, panel);
+      overlay.onpointermove = (event) => handleAnnotationPointerMove(event, panel);
+      overlay.onpointerup = (event) => handleAnnotationPointerUp(event, panel);
+      overlay.onpointerleave = (event) => handleAnnotationPointerLeave(event, panel);
+      overlay.classList.add('hidden-rects');
+    });
+
+    refreshAnnotationToolbar(panel);
   } else if (type === PANEL_TYPES.COMPANION) {
     const poemSelect = getPanelElement(panel, '.poem-select');
     const companionCheckboxes = getPanelElements(panel, '.companion-controls input');
@@ -1184,6 +2104,7 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   }
   
+  loadAnnotationsFromStorage();
   // Initialize panels after DOM is ready
   initializePanels();
 

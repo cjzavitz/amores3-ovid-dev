@@ -376,7 +376,203 @@ section[data-panel-type="viewer"] > .panel-body {
   display: flex;                /* ensure it's flex */
   flex-direction: column;
   padding: 6px 12px 12px 12px;  /* top 6px (half), right/left 12px, bottom 12px */
-  gap: 16px;                    /* increase space between buttons & viewer */
+  gap: 8px;                     /* space between controls and viewers */
+}
+
+/* === Stacked Viewers Container === */
+/* Container for 3 vertically stacked viewers */
+.viewers-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;                    /* space between each viewer section */
+  flex: 1;
+  min-height: 0;                /* allows flex to work properly */
+  overflow-y: auto;             /* enable scrolling if needed */
+}
+
+/* Individual viewer section (one per manuscript) */
+.viewer-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;                /* critical for flex children */
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  overflow: hidden;
+}
+
+/* Label above each viewer (P, Y, S) */
+.viewer-label {
+  padding: 6px 10px;
+  background-color: var(--button-bg);
+  border-bottom: 1px solid var(--panel-border);
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--text-main);
+}
+
+.viewer-wrapper {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Individual viewer canvas container */
+.viewer-section .viewer {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: none;                 /* no border since section has it */
+  border-radius: 0;             /* override previous border-radius */
+}
+
+.annotation-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+  touch-action: none;
+}
+
+.annotation-overlay.active {
+  pointer-events: auto;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.annotation-overlay.hidden-rects .annotation-rect:not(.current-annotation) {
+  display: none !important;
+}
+
+.annotation-overlay.hidden-rects .annotation-rect.current-annotation {
+  display: block !important;
+}
+
+.manuscript-label {
+  display: block;
+  margin-top: 8px;
+  margin-bottom: 4px;
+  font-size: 0.9rem;
+  color: var(--text-main);
+}
+
+.manuscript-select {
+  width: 100%;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  background: var(--input-bg);
+  color: var(--text-main);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.viewers-container.hide-Y .viewer-section[data-witness="Y"],
+.viewers-container.hide-S .viewer-section[data-witness="S"],
+.viewers-container.hide-P .viewer-section[data-witness="P"] {
+  display: none;
+}
+
+/* When only one manuscript is selected make its viewer larger */
+.viewers-container.single-view {
+  align-items: stretch;
+}
+.viewers-container.single-view .viewer-section {
+  flex: 1 1 auto;
+  min-height: 420px; /* ensure visible viewer has a comfortable height */
+}
+.viewers-container.single-view .viewer-wrapper {
+  min-height: 420px;
+}
+
+.annotation-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  background: var(--button-bg);
+}
+
+.annotation-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.9rem;
+  color: var(--text-main);
+}
+
+.annotation-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.annotation-controls select,
+.annotation-controls button {
+  font-size: 0.85rem;
+}
+
+.annotation-message {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  margin-left: 0.5rem;
+}
+
+.annotation-preview,
+.annotation-rect {
+  position: absolute;
+  border: 2px dashed rgba(255, 165, 0, 0.9);
+  background: rgba(255, 165, 0, 0.18);
+  pointer-events: none;
+}
+
+.annotation-rect {
+  border-style: solid;
+}
+
+/* Per-viewer page controls */
+.viewer-section .page-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 8px;
+  gap: 8px;
+  border-top: 1px solid var(--panel-border);
+  background-color: var(--button-bg);
+  font-size: 0.85rem;
+}
+
+.viewer-section .page-controls button {
+  padding: 3px 6px;
+  font-size: 0.8rem;
+  min-width: 24px;
+  margin: 0;
+}
+
+.viewer-section .page-controls .page-indicator {
+  font-family: monospace;
+  font-size: 0.75rem;
+  margin: 0 4px;
+  white-space: nowrap;
+}
+
+.viewer-section .page-controls .page-input {
+  width: 35px;
+  padding: 2px 4px;
+  font-size: 0.8rem;
+}
+
+.viewer-section .page-controls .go-to-page {
+  padding: 3px 6px;
+  font-size: 0.8rem;
 }
 /* Drag-handle styling */
 .drag-handle {
@@ -521,6 +717,16 @@ tei-hi[rend="alt-ink"],
     font-family: 'Open Sans', sans-serif;
     font-size: 0.8em;
     color: var(--text-muted);
+}
+
+.text-content [data-line],
+#text-content [data-line] {
+  cursor: pointer;
+}
+
+.text-content [data-line].clickable-line:hover,
+#text-content [data-line].clickable-line:hover {
+  text-decoration: underline;
 }
 
 tei-l {
