@@ -60,6 +60,7 @@ const annotationState = {
 };
 
 const ANNOTATION_STORAGE_KEY = 'amores-annotations';
+const ANNOTATION_FALLBACK_URL = 'data/annotations.json';
 
 function saveAnnotationsToStorage() {
   try {
@@ -72,26 +73,97 @@ function saveAnnotationsToStorage() {
 function loadAnnotationsFromStorage() {
   try {
     const stored = localStorage.getItem(ANNOTATION_STORAGE_KEY);
-    if (!stored) return;
+    if (!stored) return false;
 
     const parsed = JSON.parse(stored);
     if (Array.isArray(parsed)) {
-      annotationState.annotations = parsed
-        .filter(item => item && item.panelId && item.witness && item.lineId)
-        .map(item => {
-          if (!item.poem) {
-            const inferred = inferAnnotationPoem(item);
-            if (inferred) {
-              item.poem = inferred;
-            }
-          }
-          return item;
-        });
+      annotationState.annotations = normalizeAnnotationList(parsed);
+      return annotationState.annotations.length > 0;
     }
+    return false;
   } catch (error) {
     console.warn('Unable to load annotations from localStorage:', error);
     annotationState.annotations = [];
+    return false;
   }
+}
+
+function normalizeAnnotationList(items) {
+  if (!Array.isArray(items)) return [];
+
+  return items
+    .filter(item => item && item.panelId && item.witness && item.lineId)
+    .map(item => {
+      const normalized = { ...item };
+      if (!normalized.poem) {
+        const inferred = inferAnnotationPoem(normalized);
+        if (inferred) {
+          normalized.poem = inferred;
+        }
+      }
+      return normalized;
+    });
+}
+
+async function loadAnnotationsFromFallbackFile() {
+  try {
+    const resp = await fetch(ANNOTATION_FALLBACK_URL, { cache: 'no-cache' });
+    if (!resp.ok) {
+      return false;
+    }
+
+    const parsed = await resp.json();
+    const normalized = normalizeAnnotationList(parsed);
+    if (!normalized.length) {
+      return false;
+    }
+
+    annotationState.annotations = normalized;
+    saveAnnotationsToStorage();
+    console.log(`Loaded ${normalized.length} annotations from fallback file.`);
+    return true;
+  } catch (error) {
+    console.warn('Unable to load fallback annotation file:', error);
+    return false;
+  }
+}
+
+async function loadAnnotations() {
+  const loadedFromStorage = loadAnnotationsFromStorage();
+  if (loadedFromStorage) {
+    return true;
+  }
+
+  return loadAnnotationsFromFallbackFile();
+}
+
+function restoreAnnotationsForAllViewerPanels() {
+  document.querySelectorAll('section[data-panel-type="viewer"]').forEach(panel => {
+    restoreAnnotationRectanglesForPanel(panel);
+  });
+}
+
+function applyImportedAnnotations(parsed, sourceLabel = 'file') {
+  const normalized = normalizeAnnotationList(parsed);
+  if (!normalized.length) {
+    return { ok: false, message: 'No valid annotations found in the selected file.' };
+  }
+
+  annotationState.annotations = normalized;
+  saveAnnotationsToStorage();
+  restoreAnnotationsForAllViewerPanels();
+  refreshAllAnnotationToolbars();
+
+  return {
+    ok: true,
+    message: `Loaded ${normalized.length} annotation(s) from ${sourceLabel}.`
+  };
+}
+
+async function importAnnotationsFromFile(file) {
+  const text = await file.text();
+  const parsed = JSON.parse(text);
+  return applyImportedAnnotations(parsed, file.name || 'selected file');
 }
 
 function inferAnnotationPoem(annotation) {
@@ -1784,6 +1856,8 @@ function attachPanelEventHandlers(panel) {
 
     const toggleAnnotationBtn = getPanelElement(panel, '.toggle-annotation');
     const clearAnnotationsBtn = getPanelElement(panel, '.clear-annotations');
+    const importAnnotationsBtn = getPanelElement(panel, '.import-annotations');
+    const importAnnotationsInput = getPanelElement(panel, '.annotation-import-input');
     const exportAnnotationsBtn = getPanelElement(panel, '.export-annotations');
     const annotationOverlays = getPanelElements(panel, '.annotation-overlay');
 
@@ -1796,6 +1870,27 @@ function attachPanelEventHandlers(panel) {
     if (clearAnnotationsBtn) {
       clearAnnotationsBtn.onclick = () => {
         clearAnnotations(panel);
+      };
+    }
+
+    if (importAnnotationsBtn && importAnnotationsInput) {
+      importAnnotationsBtn.onclick = () => {
+        importAnnotationsInput.click();
+      };
+
+      importAnnotationsInput.onchange = async (event) => {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+
+        try {
+          const result = await importAnnotationsFromFile(file);
+          showAnnotationMessage(panel, result.message);
+        } catch (error) {
+          console.error('Failed to import annotations:', error);
+          showAnnotationMessage(panel, 'Failed to import annotations. Check that the file is valid JSON.');
+        } finally {
+          importAnnotationsInput.value = '';
+        }
       };
     }
 
@@ -2104,9 +2199,15 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   }
   
-  loadAnnotationsFromStorage();
   // Initialize panels after DOM is ready
   initializePanels();
+
+  loadAnnotations().then(loaded => {
+    if (loaded) {
+      restoreAnnotationsForAllViewerPanels();
+      refreshAllAnnotationToolbars();
+    }
+  });
 
   // Ensure tutorial overlay event handlers are attached
   bindTutorialEvents();
